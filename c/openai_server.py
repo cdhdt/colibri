@@ -271,13 +271,23 @@ def parse_tool_calls(reply, tools=None):
                 salvaged.append(name)
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-    if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
-        # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
-        # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
-        # EN: #401 field diagnosis: tools were declared and the model attempted the syntax,
-        # EN: but the strict parse matched nothing (typically quantization-mangled output).
-        sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
-                         "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
+    if tools and not calls:
+        # Diagnosi #401: distingui i due modi di fallire. (a) marker presenti ma il parse
+        # rigoroso non aggancia -> output storpiato (int4). (b) nessun marker -> il modello
+        # NON ha nemmeno provato a chiamare i tool (prompt/behavior, non parsing). Sapere QUALE
+        # dei due e' il nodo del report: senza distinguerli si tira a indovinare.
+        # EN: #401: separate the two failure modes -- markers-but-unparsed (mangled int4 output)
+        # EN: vs no-markers-at-all (the model never attempted a tool call: a prompt/behavior
+        # EN: issue, not a parsing one). COLI_DEBUG dumps the raw reply so we can SEE which.
+        if re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
+            sys.stderr.write("[api] #401: tools declared, tool-call markers present but nothing "
+                             "parsed -- output likely quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
+        else:
+            sys.stderr.write("[api] #401: tools declared but the reply has NO tool-call markers -- "
+                             "the model answered in plain text (prompt/behavior, not parsing)\n")
+        if os.environ.get("COLI_DEBUG"):
+            head = reply[:800].replace("\n", "\\n")
+            sys.stderr.write("[api] #401 raw model reply (first 800 chars): %s\n" % head)
         sys.stderr.flush()
     text = _BOX_RE.sub("", reply)
     if THINK_CLOSE in text:
@@ -310,32 +320,47 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
     elif tool_choice == "none":
         tools = None                              # the client forbade tools: do not offer them
+    # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
+    # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
+    # preamble makes it hallucinate other frameworks' syntax (e.g. `end_action`).
+    tool_block = ""
     if tools:
-        # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
-        # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
-        # preamble makes it hallucinate other frameworks' syntax (e.g. `end_action`).
-        prompt.append("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the "
-                      "user query.\n\nYou are provided with function signatures within <tools></tools> "
-                      "XML tags:\n<tools>\n")
+        parts = ["\n# Tools\n\nYou may call one or more functions to assist with the user "
+                 "query.\n\nYou are provided with function signatures within <tools></tools> "
+                 "XML tags:\n<tools>\n"]
         for tool in tools:
             fn = tool.get("function", tool) if isinstance(tool, dict) else {}
             clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
-            prompt.append(json.dumps(clean, ensure_ascii=False) + "\n")
-        prompt.append("</tools>\n\nFor each function call, output the function name and arguments "
-                      "within the following XML format:\n<tool_call>{function-name}"
-                      "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
-                      "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
+            parts.append(json.dumps(clean, ensure_ascii=False) + "\n")
+        parts.append("</tools>\n\nFor each function call, output the function name and arguments "
+                     "within the following XML format:\n<tool_call>{function-name}"
+                     "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+                     "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
         if forced:
-            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+            parts.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
         elif tool_choice == "required":
-            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
+            parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
+        tool_block = "".join(parts)
+    # #401 experiment: a coding CLI sends its own big system prompt, so the default emits TWO
+    # consecutive <|system|> turns (tools, then the client's) -- GLM may prioritize the later
+    # one and never see the tool instructions. COLI_TOOL_SYS_MERGE=1 folds the tool block into
+    # the client's system turn instead (one <|system|>, tools last), to A/B which one actually
+    # makes the model emit tool calls. Default keeps the historical two-block behavior.
+    merge_tools = bool(tool_block) and os.environ.get("COLI_TOOL_SYS_MERGE") == "1"
+    if tool_block and not merge_tools:
+        prompt.append("<|system|>" + tool_block)
+    tools_pending = tool_block if merge_tools else ""
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role in ("system", "developer"):
-            prompt.append(f"<|system|>{content_text(message.get('content'), f'messages.{index}.content')}")
+            body = content_text(message.get('content'), f'messages.{index}.content')
+            if tools_pending:                       # merge mode: fold tools into this system turn
+                body = body + "\n" + tools_pending
+                tools_pending = ""
+            prompt.append(f"<|system|>{body}")
         elif role == "user":
             prompt.append(f"<|user|>{content_text(message.get('content'), f'messages.{index}.content')}")
         elif role == "assistant":
@@ -365,6 +390,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
             raise APIError(400, f"Unsupported message role: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
         prev_tool = (role == "tool")
+    if tools_pending:                               # merge mode but no client system turn existed
+        prompt.append("<|system|>" + tools_pending)
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
